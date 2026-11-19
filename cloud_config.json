@@ -1,0 +1,5 @@
+{
+  "rpc_max_requests": 750,
+  "cloud_backtest_until_s": 1260,
+  "recap_hour": 8
+}

@@ -1,0 +1,80 @@
+# Fomo Recap dans le cloud : toutes les 30 min, même quand ton PC est éteint.
+# Collecte les trades Fomo publics, calcule le backtest, envoie les alertes feu vert
+# et le récap du matin sur Telegram. Ne passe AUCUN ordre.
+name: Fomo Recap (cloud)
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # heure UTC ; GitHub peut décaler de quelques minutes
+  workflow_dispatch:          # bouton « Run workflow » pour lancer à la main
+
+concurrency:
+  group: fomo-recap
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # ranger la base sur la branche "data"
+  actions: write    # garder le planning actif (GitHub le coupe après 60 jours sans activité)
+
+jobs:
+  passe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Récupère le code et la base
+        id: base
+        run: |
+          git clone -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" app
+          cd app
+          set +e
+          git ls-remote --exit-code --heads origin data > /dev/null
+          rc=$?
+          set -e
+          if [ "$rc" = "0" ]; then
+            git fetch -q --depth 1 origin data
+            git show FETCH_HEAD:fomo_data.sqlite.gz | gunzip > fomo_data.sqlite
+            echo "Base reprise de la branche data"
+          elif [ "$rc" = "2" ] && [ -f seed/fomo_data.sqlite.gz ]; then
+            gunzip -c seed/fomo_data.sqlite.gz > fomo_data.sqlite
+            echo "Première passe : base de départ (seed)"
+          elif [ "$rc" = "2" ]; then
+            echo "Première passe : départ de zéro"
+          else
+            echo "GitHub injoignable, on réessaiera à la prochaine passe"; exit 1
+          fi
+          ls -la
+
+      - name: Collecte, backtest, alertes, récap
+        timeout-minutes: 30
+        working-directory: app
+        env:
+          FOMO_CLOUD: "1"
+          PYTHONUNBUFFERED: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          HIDE_WALLET: ${{ secrets.HIDE_WALLET }}
+        run: python3 fomo_recap.py cloud
+
+      - name: Range la base sur la branche data
+        if: always() && steps.base.outcome == 'success'
+        working-directory: app
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          [ -f fomo_data.sqlite ] || { echo "Rien à ranger"; exit 0; }
+          python3 -c "import sqlite3; c=sqlite3.connect('fomo_data.sqlite'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.execute('PRAGMA journal_mode=DELETE'); c.close()"
+          rm -rf /tmp/data && mkdir -p /tmp/data
+          gzip -9 -c fomo_data.sqlite > /tmp/data/fomo_data.sqlite.gz
+          ls -la /tmp/data
+          cd /tmp/data
+          git init -q -b data
+          git add fomo_data.sqlite.gz
+          git -c user.name="fomo-recap-bot" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -qm "Base du $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push -qf "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+
+      - name: Garde le planning actif
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/fomo.yml/enable" || true
