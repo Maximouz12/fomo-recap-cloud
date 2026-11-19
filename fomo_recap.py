@@ -76,8 +76,8 @@ DEFAULT_CONFIG = {
     "min_retained": 20,           # en dessous : critères assouplis automatiquement (un cran)
     "no_green_days": 14,          # sans aucun feu vert pendant ce temps : diagnostic "trop strict"
     "backtest_target": 40,        # nb de créneaux mesurés (à +24 h) pour un résultat fiable (~2 semaines)
-    "fomo_token_url": "https://fomo.family/coin?address={mint}&chainId={chain}&source=share_link",
-    "fomo_chain_id": "792703809", # identifiant de Solana dans les liens Fomo
+    # Page du token dans Fomo : sur PC = page web (tu es déjà connecté), sur téléphone = l'appli Fomo
+    "fomo_token_url": "https://fomo.family/tokens/solana/{mint}",
     "pc_notify": True,            # notification Windows quand un feu vert apparaît
     "my_wallet": "",              # adresse publique de TON wallet Fomo (lecture seule)
     # Adresse qui signe tous les trades Fomo (identifiée par Bitquery, pas par Fomo).
@@ -1117,6 +1117,7 @@ def recap_text(cfg, con, save=True):
         if c["alerts"]:
             L.append("   Alertes : " + ", ".join(c["alerts"]))
         L.append(f"   Adresse : {c['mint']}")
+        L.append(f"   Ouvrir dans Fomo : {fomo_url(cfg, c['mint'])}")
     L.append("")
     L.extend(tracking_lines(cfg, con))
     L.append("")
@@ -1692,8 +1693,10 @@ def token_detail(cfg, con, mint):
 
 def fomo_url(cfg, mint):
     """Lien qui ouvre le token dans Fomo (navigateur sur PC, appli Fomo sur téléphone)."""
-    tpl = cfg.get("fomo_token_url") or DEFAULT_CONFIG["fomo_token_url"]
-    return tpl.replace("{mint}", mint).replace("{chain}", str(cfg.get("fomo_chain_id") or DEFAULT_CONFIG["fomo_chain_id"]))
+    tpl = cfg.get("fomo_token_url") or ""
+    if "{mint}" not in tpl or "chainId" in tpl:  # ancien format qui renvoyait à l'accueil
+        tpl = DEFAULT_CONFIG["fomo_token_url"]
+    return tpl.replace("{mint}", mint)
 
 
 def windows_toast(title, body, url=None):
