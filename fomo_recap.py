@@ -76,7 +76,9 @@ DEFAULT_CONFIG = {
     "min_retained": 20,           # en dessous : critères assouplis automatiquement (un cran)
     "no_green_days": 14,          # sans aucun feu vert pendant ce temps : diagnostic "trop strict"
     "backtest_target": 40,        # nb de créneaux mesurés (à +24 h) pour un résultat fiable (~2 semaines)
-    "fomo_token_url": "",         # modèle de lien Fomo vers un token, avec {mint} (si tu trouves le format)
+    "fomo_token_url": "https://fomo.family/coin?address={mint}&chainId={chain}&source=share_link",
+    "fomo_chain_id": "792703809", # identifiant de Solana dans les liens Fomo
+    "pc_notify": True,            # notification Windows quand un feu vert apparaît
     "my_wallet": "",              # adresse publique de TON wallet Fomo (lecture seule)
     # Adresse qui signe tous les trades Fomo (identifiée par Bitquery, pas par Fomo).
     "fomo_signer": "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51",
@@ -1263,22 +1265,21 @@ def check_alerts(cfg, con, green=True, exits=True):
         return None
     now = time.time()
     stats, good, rejected, ranked, positions = enriched_recap(cfg, con)
-    top = ranked[: int(cfg["max_candidates"])]
-    oldest = con.execute("SELECT MIN(ts) FROM trades").fetchone()[0]
-    hist = (now - oldest) / 86400 if oldest else 0
     sent = None
     if green and cfg.get("alert_on_green", True):
-        sig = build_signal(cfg, con, top, hist, now)
-        c = sig.get("candidate")
-        if sig["level"] == "green" and c:
+        c = current_green(cfg, con)
+        if c:
             key = "alert_" + datetime.now().strftime("%Y-%m-%d") + "_" + c["mint"]
             if not meta_get(con, key):
                 bt = backtest_data(cfg, con)
                 test = "" if bt["measured"] >= bt["target"] else "PHASE DE TEST (backtest pas encore fiable) : ne mise pas, observe.\n"
-                send(cfg, test + f"FEU VERT Fomo : {c['sym']}\n"
+                url = fomo_url(cfg, c["mint"])
+                send(cfg, test + f"🟢 FEU VERT Fomo : {c['sym']}\n"
                           f"{c['n']} bons traders dessus, {c['change']:+.0f} % depuis leur achat.\n"
-                          f"Adresse : {c['mint']}\n"
-                          f"Ouvre l'appli Fomo Recap pour voir le graphique. Petite mise seulement, c'est toi qui décides.")
+                          f"Adresse : {c['mint']}\n\n"
+                          f"Prendre le trade dans Fomo : {url}\n\n"
+                          f"Petite mise seulement, c'est toi qui décides.",
+                     button=("📱 Prendre le trade sur Fomo", url))
                 meta_set(con, key, now)
                 sent = c["sym"]
     if exits and cfg.get("alert_on_exit", True) and not cfg.get("_cloud"):
@@ -1686,7 +1687,71 @@ def token_detail(cfg, con, mint):
             "observed": {"trades": n_tr, "wallets": n_w, "usd": vol},
             "candidate": bool(c), "entry": entry, "n_good": (c or {}).get("n", 0),
             "plan": trade_plan(cfg, price, entry) if c else None,
-            "fomo_url": cfg["fomo_token_url"].replace("{mint}", mint) if cfg.get("fomo_token_url") else None}
+            "fomo_url": fomo_url(cfg, mint)}
+
+
+def fomo_url(cfg, mint):
+    """Lien qui ouvre le token dans Fomo (navigateur sur PC, appli Fomo sur téléphone)."""
+    tpl = cfg.get("fomo_token_url") or DEFAULT_CONFIG["fomo_token_url"]
+    return tpl.replace("{mint}", mint).replace("{chain}", str(cfg.get("fomo_chain_id") or DEFAULT_CONFIG["fomo_chain_id"]))
+
+
+def windows_toast(title, body, url=None):
+    """Notification Windows (en bas à droite). Clic = ouvre le lien Fomo."""
+    if os.name != "nt":
+        return False
+    import subprocess
+    from xml.sax.saxutils import escape, quoteattr
+    head = f'<toast activationType="protocol" launch={quoteattr(url)} scenario="reminder">' if url else "<toast>"
+    actions = (f'<actions><action content="Prendre le trade sur Fomo" activationType="protocol" arguments={quoteattr(url)}/>'
+               f'<action content="Plus tard" activationType="system" arguments="dismiss"/></actions>') if url else ""
+    xml = (head + '<visual><binding template="ToastGeneric">'
+           f"<text>{escape(title)}</text><text>{escape(body)}</text></binding></visual>"
+           + actions + '<audio src="ms-winsoundevent:Notification.Reminder"/></toast>')
+    ps = ("$ErrorActionPreference='Stop';"
+          "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+          "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;"
+          "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:FOMO_TOAST);"
+          "$t = New-Object Windows.UI.Notifications.ToastNotification $x;"
+          "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+          "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($t)")
+    env = dict(os.environ, FOMO_TOAST=xml)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       env=env, creationflags=0x08000000, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("notification Windows : " + (r.stderr or b"").decode("utf-8", "replace")[-300:])
+    return True
+
+
+def current_green(cfg, con):
+    """Le feu vert du moment (toutes les conditions remplies), sinon None."""
+    now = time.time()
+    stats, good, rejected, ranked, positions = enriched_recap(cfg, con)
+    top = ranked[: int(cfg["max_candidates"])]
+    oldest = con.execute("SELECT MIN(ts) FROM trades").fetchone()[0]
+    hist = (now - oldest) / 86400 if oldest else 0
+    sig = build_signal(cfg, con, top, hist, now)
+    c = sig.get("candidate")
+    return c if sig["level"] == "green" and c else None
+
+
+def pc_notify(cfg, con, cand=None, force=False):
+    """Notification Windows, une fois par token et par jour."""
+    if not cfg.get("pc_notify", True):
+        return None
+    c = cand or current_green(cfg, con)
+    if not c:
+        return None
+    key = "pcnotif_" + datetime.now().strftime("%Y-%m-%d") + "_" + c["mint"]
+    if meta_get(con, key) and not force:
+        return None
+    bt = backtest_data(cfg, con)
+    test = "" if bt["measured"] >= bt["target"] else " (phase de test : observe)"
+    windows_toast(f"🟢 FEU VERT : {c['sym']}{test}",
+                  f"{c['n']} bons traders dessus, {c['change']:+.0f} % depuis leur achat. Clique pour l'ouvrir dans Fomo.",
+                  fomo_url(cfg, c["mint"]))
+    meta_set(con, key, time.time())
+    return c["sym"]
 
 
 def send_take(cfg, con, mint):
@@ -1704,12 +1769,9 @@ def send_take(cfg, con, mint):
                   f"Stop ({p['stop_pct']} %) : {p['stop']:.10g} $",
                   f"Objectif 1 (+{p['t1_pct']:.0f} %, vendre la moitié) : {p['target1']:.10g} $",
                   f"Objectif 2 (+{p['t2_pct']:.0f} %, vendre le reste) : {p['target2']:.10g} $", ""]
-    if d.get("fomo_url"):
-        lines += ["Ouvrir dans Fomo : " + d["fomo_url"], ""]
-    else:
-        lines += ["Dans Fomo : loupe (recherche) -> colle l'adresse -> Acheter.", ""]
+    lines += ["Ouvrir dans Fomo : " + d["fomo_url"], ""]
     lines += ["Petite mise seulement. C'est toi qui décides."]
-    send(cfg, "\n".join(x for x in lines if x is not None))
+    send(cfg, "\n".join(x for x in lines if x is not None), button=("📱 Prendre le trade sur Fomo", d["fomo_url"]))
     return d["sym"]
 
 
@@ -2016,13 +2078,19 @@ def pc_collect(cfg, con, verbose=True):
             except Exception as e:
                 if verbose:
                     print("Alerte impossible :", e)
+            notif = None
+            try:
+                notif = pc_notify(cfg, con)
+            except Exception as e:
+                if verbose:
+                    print("Notification :", e)
             if verbose:
                 print(f"Mode cloud : {state}. Ton wallet : {n} trades ajoutés.")
-            return {"cloud": True, "state": state, "added": n}
+            return {"cloud": True, "state": state, "added": n, "notif": notif}
         if verbose:
             print(f"Cloud muet depuis plus de {cfg['cloud_stale_hours']} h ({state}) : le PC collecte lui-même.")
     n = collect(cfg, con, verbose=verbose)
-    sym = None
+    sym = notif = None
     try:
         sym = check_alerts(cfg, con)
         if sym and verbose:
@@ -2030,7 +2098,12 @@ def pc_collect(cfg, con, verbose=True):
     except Exception as e:
         if verbose:
             print("Alerte impossible :", e)
-    return {"cloud": False, "added": n, "sym": sym}
+    try:
+        notif = pc_notify(cfg, con)
+    except Exception as e:
+        if verbose:
+            print("Notification :", e)
+    return {"cloud": False, "added": n, "sym": sym, "notif": notif}
 
 
 # --------------------------------------------------------------------------
@@ -2046,13 +2119,16 @@ def telegram(cfg, method, params=None):
         return json.loads(r.read().decode())
 
 
-def send(cfg, text):
+def send(cfg, text, button=None):
+    """button=(texte, lien) : ajoute un bouton cliquable sous le message (ouvre l'appli Fomo)."""
     if not cfg.get("telegram_chat_id"):
         raise RuntimeError("telegram_chat_id vide dans config.json (lance : run.bat telegram-id)")
-    for i in range(0, len(text), 3900):
-        telegram(cfg, "sendMessage", {"chat_id": cfg["telegram_chat_id"],
-                                      "text": text[i:i + 3900],
-                                      "disable_web_page_preview": True})
+    chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)] or [""]
+    for n, chunk in enumerate(chunks):
+        params = {"chat_id": cfg["telegram_chat_id"], "text": chunk, "disable_web_page_preview": True}
+        if button and n == len(chunks) - 1:
+            params["reply_markup"] = {"inline_keyboard": [[{"text": button[0], "url": button[1]}]]}
+        telegram(cfg, "sendMessage", params)
 
 
 # --------------------------------------------------------------------------
